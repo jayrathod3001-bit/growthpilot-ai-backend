@@ -28,7 +28,7 @@ app.use(businessRouter)
 app.use(adminRouter)
 app.use(imageRouter)
 app.use(aiRouter)
-const PORT = process.env.PORT
+const PORT = process.env.PORT || 5000
 app.get('/', (req, res) => {
     res.send("Backend run successfully")
 })

@@ -1,19 +1,59 @@
 import axios from 'axios';
-import { Agent } from 'http';
+import { Agent as HttpAgent } from 'http';
+import { Agent as HttpsAgent } from 'https';
 
-// Persistent HTTP agent with keep-alive for faster repeated requests to local model
-const keepAliveAgent = new Agent({ keepAlive: true, maxSockets: 5 });
+// Persistent agents with keep-alive for fast repeated calls
+const keepAliveHttp = new HttpAgent({ keepAlive: true, maxSockets: 5 });
+const keepAliveHttps = new HttpsAgent({ keepAlive: true, maxSockets: 5 });
 
-// Axios instance tuned for local LLM calls
+// Axios instance tuned for local & ngrok LLM calls
 const localLLMAxios = axios.create({
-    httpAgent: keepAliveAgent,
-    headers: { 'Content-Type': 'application/json' }
+    httpAgent: keepAliveHttp,
+    httpsAgent: keepAliveHttps,
+    headers: {
+        'Content-Type': 'application/json',
+        'ngrok-skip-browser-warning': 'true',
+        'User-Agent': 'GrowthPilot-AI'
+    }
 });
 
 let cachedModel = null;
 
 /**
- * Resolves the active model identifier from the local Qwen OpenAI-compatible server.
+ * Normalizes user-provided or environment base URLs so paths are clean
+ * (e.g. strips trailing slash, ensures /v1 suffix).
+ */
+export const normalizeBaseUrl = (rawUrl) => {
+    if (!rawUrl || typeof rawUrl !== 'string' || !rawUrl.trim()) {
+        return 'http://127.0.0.1:8080/v1';
+    }
+    let url = rawUrl.trim();
+    // Strip trailing slashes
+    url = url.replace(/\/+$/, '');
+    // Ensure /v1 endpoint segment
+    if (!url.endsWith('/v1')) {
+        url = `${url}/v1`;
+    }
+    return url;
+};
+
+/**
+ * Common headers for local or ngrok LLM requests, including optional auth.
+ */
+const getLocalLLMHeaders = () => {
+    const headers = {
+        'Content-Type': 'application/json',
+        'ngrok-skip-browser-warning': 'true',
+        'User-Agent': 'GrowthPilot-AI'
+    };
+    if (process.env.LOCAL_LLM_API_KEY && process.env.LOCAL_LLM_API_KEY.trim()) {
+        headers['Authorization'] = `Bearer ${process.env.LOCAL_LLM_API_KEY.trim()}`;
+    }
+    return headers;
+};
+
+/**
+ * Resolves the active model identifier from the local/ngrok OpenAI-compatible server.
  */
 export const getLocalModel = async (baseUrl) => {
     if (process.env.LOCAL_LLM_MODEL && process.env.LOCAL_LLM_MODEL.trim()) {
@@ -24,15 +64,18 @@ export const getLocalModel = async (baseUrl) => {
     }
 
     try {
-        const response = await localLLMAxios.get(`${baseUrl}/models`, { timeout: 5000 });
+        const response = await localLLMAxios.get(`${baseUrl}/models`, {
+            headers: getLocalLLMHeaders(),
+            timeout: 8000
+        });
         const modelsList = response.data?.data || response.data?.models || [];
         if (modelsList.length > 0) {
             cachedModel = modelsList[0].id || modelsList[0].name || modelsList[0].model;
-            console.log(`Auto-detected local LLM model: ${cachedModel}`);
+            console.log(`[Local LLM] Auto-detected model: ${cachedModel}`);
             return cachedModel;
         }
     } catch (err) {
-        console.warn(`Could not auto-detect model from ${baseUrl}/models: ${err.message}`);
+        console.warn(`[Local LLM] Could not auto-detect model from /models: ${err.message}. Using default.`);
     }
 
     return 'qwen2.5-coder-3b-instruct-q4_k_m.gguf';
@@ -102,12 +145,111 @@ I can assist you with:
 How can I help boost your business today?`;
 };
 
+/**
+ * NVIDIA API Text Generation
+ */
+/**
+ * NVIDIA API Text Generation (build.nvidia.com)
+ */
+const callNvidiaApi = async ({ fullMessages, temperature, maxTokens, timeout }) => {
+    const nvidiaKey = process.env.NVIDIA_API_KEY;
+    if (!nvidiaKey || !nvidiaKey.trim()) return null;
+
+    const rawBaseUrl = process.env.NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1';
+    let baseUrl = rawBaseUrl.trim().replace(/\/+$/, '');
+    if (!baseUrl.endsWith('/v1')) {
+        baseUrl = `${baseUrl}/v1`;
+    }
+    const endpoint = `${baseUrl}/chat/completions`;
+    const model = process.env.NVIDIA_MODEL || 'minimaxai/minimax-m3.1-flash';
+    // Keep timeout reasonable (15-20s) so rate limits or queue delays fail over quickly
+    const requestTimeout = parseInt(process.env.NVIDIA_TIMEOUT, 10) || timeout || 20000;
+
+    try {
+        const res = await axios.post(endpoint, {
+            model,
+            messages: fullMessages,
+            temperature: typeof temperature === 'number' ? temperature : 0.6,
+            max_tokens: Math.max(maxTokens || 1024, 600),
+            stream: false
+        }, {
+            headers: {
+                'Authorization': `Bearer ${nvidiaKey.trim()}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: requestTimeout
+        });
+
+        const choice = res.data?.choices?.[0];
+        if (!choice) return null;
+
+        let output = choice.message?.content;
+        if (!output && choice.message?.reasoning_content) {
+            output = choice.message.reasoning_content;
+        }
+
+        if (output && typeof output === 'string' && output.trim()) {
+            return output.trim();
+        }
+        return null;
+    } catch (nvidiaErr) {
+        const status = nvidiaErr.response?.status;
+        const errMsg = nvidiaErr.response?.data?.message || nvidiaErr.response?.data?.error?.message || nvidiaErr.message;
+        console.warn(`[NVIDIA API] Notice (HTTP ${status || 'timeout'}): ${errMsg}. Failover to backup provider.`);
+        return null;
+    }
+};
+
+/**
+ * Groq Cloud AI Generation (Lightning fast 120B / 20B models)
+ */
+const callGroqApi = async ({ fullMessages, temperature, maxTokens, timeout, jsonMode = false }) => {
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey || !groqKey.trim()) return null;
+
+    const model = jsonMode ? 'openai/gpt-oss-20b' : (process.env.GROQ_MODEL || 'openai/gpt-oss-120b');
+    const requestTimeout = timeout || 25000;
+
+    try {
+        const payload = {
+            model,
+            messages: fullMessages,
+            temperature: typeof temperature === 'number' ? temperature : 0.7,
+            max_tokens: maxTokens || 2048,
+            stream: false
+        };
+
+        if (jsonMode) {
+            payload.response_format = { type: 'json_object' };
+        }
+
+        const res = await axios.post('https://api.groq.com/openai/v1/chat/completions', payload, {
+            headers: {
+                'Authorization': `Bearer ${groqKey.trim()}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: requestTimeout
+        });
+
+        const content = res.data?.choices?.[0]?.message?.content;
+        if (content && typeof content === 'string' && content.trim()) {
+            return content.trim();
+        }
+        return null;
+    } catch (groqErr) {
+        const errMsg = groqErr.response?.data?.error?.message || groqErr.message;
+        console.warn(`[Groq Cloud] API notice: ${errMsg}.`);
+        return null;
+    }
+};
+
 export const generateText = async ({
     messages = [],
     systemPrompt = '',
     temperature = 0.7,
     maxTokens = 2048,
-    timeout = 15000
+    timeout = 90000,
+    jsonMode = false
 }) => {
     const fullMessages = [];
     if (systemPrompt && systemPrompt.trim()) {
@@ -119,67 +261,71 @@ export const generateText = async ({
         }
     }
 
-    // 1. Try Groq Cloud LLM (Ultra fast, generous tokens)
-    const groqKey = process.env.GROQ_API_KEY;
-    if (groqKey && groqKey.trim()) {
+    const preferredProvider = process.env.AI_PROVIDER || (process.env.USE_GROQ_API === 'true' ? 'groq' : 'nvidia');
+
+    // Strategy 1: If Groq is preferred or configured as primary
+    if (preferredProvider === 'groq') {
+        const groqResult = await callGroqApi({ fullMessages, temperature, maxTokens, timeout, jsonMode });
+        if (groqResult) return groqResult;
+
+        const nvidiaResult = await callNvidiaApi({ fullMessages, temperature, maxTokens, timeout });
+        if (nvidiaResult) return nvidiaResult;
+    } else {
+        // Strategy 2: Primary NVIDIA, with instant Groq failover
+        const useNvidia = process.env.USE_NVIDIA_API !== 'false' && Boolean(process.env.NVIDIA_API_KEY);
+        if (useNvidia) {
+            const nvidiaResult = await callNvidiaApi({ fullMessages, temperature, maxTokens, timeout });
+            if (nvidiaResult) return nvidiaResult;
+        }
+
+        // Groq High-Speed Cloud Fallback (openai/gpt-oss-120b)
+        const groqResult = await callGroqApi({ fullMessages, temperature, maxTokens, timeout, jsonMode });
+        if (groqResult) return groqResult;
+    }
+
+    // Strategy 3: Local LLM (if enabled)
+    const useLocalLLM = process.env.USE_LOCAL_LLM === 'true';
+    if (useLocalLLM) {
+        const rawBaseUrl = process.env.LOCAL_LLM_BASE_URL || 'http://127.0.0.1:8080/v1';
+        const baseUrl = normalizeBaseUrl(rawBaseUrl);
+        const configuredTimeout = parseInt(process.env.LOCAL_LLM_TIMEOUT, 10) || timeout || 90000;
+
         try {
-            const groqRes = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
-                model: 'qwen/qwen3.8-27b',
+            const model = await getLocalModel(baseUrl);
+            const localRes = await localLLMAxios.post(`${baseUrl}/chat/completions`, {
+                model,
                 messages: fullMessages,
-                temperature: typeof temperature === 'number' ? temperature : 0.7,
-                max_tokens: maxTokens || 2048,
+                temperature: typeof temperature === 'number' ? temperature : (parseFloat(process.env.LOCAL_LLM_TEMPERATURE) || 0.7),
+                max_tokens: maxTokens || parseInt(process.env.LOCAL_LLM_MAX_TOKENS, 10) || 2048,
                 stream: false
             }, {
-                headers: {
-                    'Authorization': `Bearer ${groqKey.trim()}`,
-                    'Content-Type': 'application/json'
-                },
-                timeout: 8000
+                headers: getLocalLLMHeaders(),
+                timeout: configuredTimeout
             });
 
-            const content = groqRes.data?.choices?.[0]?.message?.content;
-            if (content && typeof content === 'string' && content.trim()) {
-                return content.trim();
+            const localContent = localRes.data?.choices?.[0]?.message?.content;
+            if (localContent && typeof localContent === 'string' && localContent.trim()) {
+                return localContent.trim();
             }
-        } catch (groqErr) {
-            console.warn('Groq text generation warning:', groqErr.response?.data?.error?.message || groqErr.message);
+        } catch (localErr) {
+            const endpointType = baseUrl.includes('ngrok') ? 'ngrok tunnel' : 'local server';
+            console.warn(`[Local LLM] ${endpointType} notice: ${localErr.message}.`);
         }
     }
 
-    // 2. Try Local Qwen if running (with 2s timeout)
-    const rawBaseUrl = process.env.LOCAL_LLM_BASE_URL || 'http://127.0.0.1:8080/v1';
-    const baseUrl = rawBaseUrl.endsWith('/') ? rawBaseUrl.slice(0, -1) : rawBaseUrl;
-    try {
-        const model = await getLocalModel(baseUrl);
-        const localRes = await localLLMAxios.post(`${baseUrl}/chat/completions`, {
-            model,
-            messages: fullMessages,
-            temperature,
-            max_tokens: maxTokens || 2048,
-            stream: false
-        }, {
-            timeout: 2000
-        });
-
-        const localContent = localRes.data?.choices?.[0]?.message?.content;
-        if (localContent && typeof localContent === 'string' && localContent.trim()) {
-            return localContent.trim();
-        }
-    } catch {}
-
-    // 3. Graceful instant fallback - never display offline errors or notices to user!
+    // Ultimate fallback template: Never break production for the end user!
     return getFallbackText(messages, systemPrompt);
 };
 
 /**
- * Helper to generate and safely extract structured JSON from Qwen.
- * Includes auto-repair for truncated outputs and graceful fallback.
+ * Helper to generate and safely extract structured JSON.
+ * Includes auto-repair for truncated outputs, native JSON mode, and graceful fallback.
  */
 export const generateStructuredJSON = async ({
     messages = [],
     systemPrompt = '',
     temperature = 0.3,
-    maxTokens = 500,   // safety default — callers should always pass explicit limit
+    maxTokens = 800,   // safety default
     fallback = null
 }) => {
     const jsonInstruction = `\nCRITICAL: Respond ONLY with a valid JSON object matching the requested structure. No markdown backticks, no preamble, no "Here is", no thinking text, no explanations. Start directly with { and end with }.`;
@@ -189,7 +335,8 @@ export const generateStructuredJSON = async ({
         messages,
         systemPrompt: enrichedSystemPrompt,
         temperature,
-        maxTokens
+        maxTokens,
+        jsonMode: true
     });
 
     const repairJSON = (text) => {
@@ -221,13 +368,13 @@ export const generateStructuredJSON = async ({
         // Attempt direct parse first
         try {
             return JSON.parse(cleaned);
-        } catch {}
+        } catch { }
 
         // Attempt repair: balance open brackets and braces
         try {
             const repaired = balanceJSON(cleaned);
             return JSON.parse(repaired);
-        } catch {}
+        } catch { }
 
         return null;
     };
